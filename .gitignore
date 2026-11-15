@@ -1,0 +1,12 @@
+# Generated data / db (reproducible via generate_sample_data.py + etl_pipeline.py)
+data/raw/*.csv
+data/*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
