@@ -1,7 +1,9 @@
 # Generated data / db (reproducible via generate_sample_data.py + etl_pipeline.py)
-data/raw/*.csv
-data/*.db
 
+data/*.db
+# Exported tables for Power BI (regenerable)
+data/fact_*.csv
+data/dim_*.csv
 # Python
 __pycache__/
 *.pyc
