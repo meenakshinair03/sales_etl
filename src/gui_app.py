@@ -1,277 +1,288 @@
 """
-streamlit_app.py
-----------------
-Streamlit version of the Sales ETL GUI, built for deployment
-(Streamlit Community Cloud, Docker, any server).
+app.py
+------
+Streamlit web app for the Sales Data ETL Pipeline.
 
-  - Upload a raw CSV (or use the bundled sample) -- no local file dialogs
-  - Run the ETL pipeline with a live log
-  - Browse star-schema tables and run read-only SQL
-  - View charts: revenue trend, top products, regional sales
+Sections:
+  1. Run Pipeline   - upload Source 1 and Source 2 CSVs separately, run extract/transform/load
+  2. SQL Explorer   - browse tables or run any SQL query against the star schema
+  3. Graph Analysis - trend, category, region, correlation, distribution charts
 
-Run locally:
-    streamlit run src/streamlit_app.py
-
-Deploy (Streamlit Community Cloud):
-    Main file path: src/streamlit_app.py
+Run locally:  streamlit run src/app.py
 """
 
+import io
 import sqlite3
-import tempfile
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import streamlit as st
 
 from etl_pipeline import run_pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SAMPLE_CSV = PROJECT_ROOT / "data" / "raw" / "sales_data.csv"
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
+DEFAULT_DB = PROJECT_ROOT / "data" / "sales.db"
 
-ACCENT = "#7aa2f7"
-PANEL = "#282a3a"
-TEXT = "#e8e8ec"
-MUTED = "#9aa0b4"
+REQUIRED_COLUMNS = {"order_id", "order_date", "product_name", "category",
+                    "region", "customer_name", "quantity", "unit_price"}
 
-st.set_page_config(page_title="Sales Data ETL Pipeline", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Sales ETL Pipeline", page_icon="📊", layout="wide")
+sns.set_theme(style="darkgrid")
 
+# --------------------------------------------------------------------------
+# Sidebar - pipeline controls
+# --------------------------------------------------------------------------
+st.sidebar.title("📊 Sales ETL Pipeline")
+st.sidebar.caption("CSV sources → Pandas clean/transform → SQLite star schema → SQL + graph analysis")
 
-# ----------------------------------------------------------------------
-# Session state
-# ----------------------------------------------------------------------
-def _init_state():
-    if "workdir" not in st.session_state:
-        # Per-session scratch space: deployed filesystems are ephemeral
-        # and shared between visitors, so never write into the repo.
-        st.session_state.workdir = Path(tempfile.mkdtemp(prefix="sales_etl_"))
-    st.session_state.setdefault("db_path", None)
-    st.session_state.setdefault("log", [])
-    st.session_state.setdefault("db_version", 0)  # busts the query cache after each run
-    st.session_state.setdefault("sql_text", "SELECT * FROM fact_sales LIMIT 20;")
+db_path = Path(st.sidebar.text_input("SQLite DB path", value=str(DEFAULT_DB)))
 
+st.sidebar.subheader("1. Raw CSV sources")
 
-_init_state()
+src1 = st.sidebar.file_uploader("Source 1 CSV (e.g. online sales)", type="csv", key="src1")
+src2 = st.sidebar.file_uploader("Source 2 CSV (e.g. retail store sales)", type="csv", key="src2")
 
 
-# ----------------------------------------------------------------------
-# DB helpers
-# ----------------------------------------------------------------------
-def _connect_readonly(db_path):
-    """Open the DB read-only so user-typed SQL can't modify or drop anything."""
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+def check_upload(uf, label):
+    """Validate columns; return the set of order_ids (empty set if invalid)."""
+    try:
+        df = pd.read_csv(io.BytesIO(uf.getvalue()))
+    except Exception as e:
+        st.sidebar.error(f"{label}: could not read CSV ({e})")
+        return None
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        st.sidebar.error(f"{label} is missing columns: {', '.join(sorted(missing))}")
+        return None
+    st.sidebar.success(f"{label}: {len(df):,} rows ✓")
+    return set(df["order_id"].dropna())
 
 
-@st.cache_data(show_spinner=False)
-def query_df(db_path: str, sql: str, version: int) -> pd.DataFrame:
-    # `version` is only part of the cache key
-    conn = _connect_readonly(db_path)
+ids1 = check_upload(src1, "Source 1") if src1 else None
+ids2 = check_upload(src2, "Source 2") if src2 else None
+
+if ids1 and ids2:
+    overlap = ids1 & ids2
+    if overlap:
+        st.sidebar.warning(
+            f"{len(overlap):,} order_ids appear in BOTH files. The pipeline drops "
+            "duplicate order_ids, so those rows would be lost. Use unique IDs per source."
+        )
+
+uploads_present = src1 is not None or src2 is not None
+existing_csvs = sorted(str(p) for p in RAW_DIR.glob("*.csv")) if RAW_DIR.exists() else []
+selected_existing = st.sidebar.multiselect(
+    "…or use files already in data/raw/",
+    options=existing_csvs,
+    default=[] if uploads_present else existing_csvs,
+)
+
+run_clicked = st.sidebar.button("▶ Run ETL Pipeline", type="primary")
+
+if "log_lines" not in st.session_state:
+    st.session_state.log_lines = []
+
+if run_clicked:
+    csv_paths = list(selected_existing)
+    used_names = {Path(p).name for p in csv_paths}
+
+    # Save each uploaded file under its own name so source_system stays distinct
+    for uf, slot, ids in ((src1, "source1", ids1), (src2, "source2", ids2)):
+        if uf is None or ids is None:
+            continue
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        name = uf.name
+        if name in used_names:
+            p = Path(name)
+            name = f"{p.stem}_{slot}{p.suffix}"
+        used_names.add(name)
+        dest = RAW_DIR / name
+        dest.write_bytes(uf.getvalue())
+        csv_paths.append(str(dest))
+
+    if not csv_paths:
+        st.sidebar.error("Upload at least one valid CSV (Source 1 and/or Source 2).")
+    else:
+        st.session_state.log_lines = []
+
+        def log_callback(msg):
+            st.session_state.log_lines.append(msg)
+
+        with st.spinner("Running extract → transform → load…"):
+            try:
+                run_pipeline([Path(p) for p in csv_paths], db_path, log_callback=log_callback)
+                st.sidebar.success(f"Pipeline finished using {len(csv_paths)} source file(s).")
+            except Exception as e:
+                st.sidebar.error(f"Pipeline failed: {e}")
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def db_ready():
+    return db_path.exists()
+
+
+def query(sql: str) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
     try:
         return pd.read_sql_query(sql, conn)
     finally:
         conn.close()
 
 
-def list_tables(db_path):
-    conn = _connect_readonly(db_path)
-    try:
-        return [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")]
-    finally:
-        conn.close()
+def list_tables():
+    return query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")["name"].tolist()
 
 
-def db_ready():
-    p = st.session_state.db_path
-    return p is not None and Path(p).exists()
+# --------------------------------------------------------------------------
+# Main layout
+# --------------------------------------------------------------------------
+tab_log, tab_sql, tab_charts = st.tabs(["🪵 Pipeline Log", "🔎 SQL Explorer", "📈 Graph Analysis"])
 
-
-# ----------------------------------------------------------------------
-# ETL runner
-# ----------------------------------------------------------------------
-def run_etl(csv_path: Path):
-    db_path = st.session_state.workdir / "sales.db"
-    st.session_state.log = ["--- Starting pipeline ---"]
-    log_box = st.empty()
-
-    def log(msg):
-        st.session_state.log.append(str(msg))
-        log_box.code("\n".join(st.session_state.log), language="text")
-
-    log_box.code("\n".join(st.session_state.log), language="text")
-    try:
-        if db_path.exists():
-            db_path.unlink()  # fresh DB each run
-        run_pipeline(csv_path, db_path, log_callback=log)
-        log("--- Pipeline finished successfully ---")
-        st.session_state.db_path = str(db_path)
-        st.session_state.db_version += 1
-        query_df.clear()
-        return True
-    except Exception as e:  # noqa: BLE001
-        log(f"ERROR: {e}")
-        st.error(f"Pipeline failed: {e}")
-        return False
-
-
-# ----------------------------------------------------------------------
-# Charts
-# ----------------------------------------------------------------------
-def _style_ax(fig, ax, title):
-    fig.patch.set_facecolor(PANEL)
-    ax.set_facecolor(PANEL)
-    ax.set_title(title, color=TEXT)
-    ax.tick_params(colors=TEXT)
-    for spine in ax.spines.values():
-        spine.set_color(MUTED)
-
-
-def chart_revenue_trend(df):
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.plot(df["period"], df["revenue"], color=ACCENT, marker="o", linewidth=2)
-    _style_ax(fig, ax, "Monthly Revenue Trend")
-    ax.tick_params(axis="x", rotation=60, labelsize=7)
-    fig.tight_layout()
-    return fig
-
-
-def chart_top_products(df):
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.barh(df["product_name"][::-1], df["revenue"][::-1], color=ACCENT)
-    _style_ax(fig, ax, "Top 10 Products by Revenue")
-    ax.tick_params(labelsize=8)
-    fig.tight_layout()
-    return fig
-
-
-def chart_regional_sales(df):
-    fig, ax = plt.subplots(figsize=(6, 5))
-    colors = plt.cm.Blues([max(0.2, 0.9 - i * 0.13) for i in range(len(df))])
-    ax.pie(df["revenue"], labels=df["region_name"], autopct="%1.1f%%",
-           colors=colors, textprops={"color": TEXT})
-    fig.patch.set_facecolor(PANEL)
-    ax.set_title("Revenue Share by Region", color=TEXT)
-    fig.tight_layout()
-    return fig
-
-
-CHARTS = {
-    "Revenue Trend": (
-        """
-        SELECT d.year || '-' || printf('%02d', d.month) AS period,
-               ROUND(SUM(f.revenue),2) AS revenue
-        FROM fact_sales f JOIN dim_date d ON f.date_id = d.date_id
-        GROUP BY d.year, d.month ORDER BY d.year, d.month;
-        """,
-        chart_revenue_trend,
-    ),
-    "Top Products": (
-        """
-        SELECT p.product_name, ROUND(SUM(f.revenue),2) AS revenue
-        FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
-        GROUP BY p.product_id ORDER BY revenue DESC LIMIT 10;
-        """,
-        chart_top_products,
-    ),
-    "Regional Sales": (
-        """
-        SELECT r.region_name, ROUND(SUM(f.revenue),2) AS revenue
-        FROM fact_sales f JOIN dim_region r ON f.region_id = r.region_id
-        GROUP BY r.region_id ORDER BY revenue DESC;
-        """,
-        chart_regional_sales,
-    ),
-}
-
-
-# ----------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------
-st.title("📊 Sales Data ETL Pipeline")
-st.caption("CSV → Pandas (clean/transform) → SQLite star schema → SQL reporting")
-
-# --- Sidebar: input + run ---
-with st.sidebar:
-    st.header("1. Choose data")
-    options = ["Upload CSV"]
-    if SAMPLE_CSV.exists():
-        options.append("Use sample data")
-    source = st.radio("Source", options, label_visibility="collapsed")
-
-    uploaded = None
-    if source == "Upload CSV":
-        uploaded = st.file_uploader("Raw sales CSV", type=["csv"])
-
-    st.header("2. Run")
-    run_clicked = st.button("▶ Run ETL Pipeline", type="primary", use_container_width=True)
+with tab_log:
+    st.subheader("Pipeline run log")
+    if st.session_state.log_lines:
+        st.code("\n".join(st.session_state.log_lines), language="text")
+    else:
+        st.info("No pipeline run yet. Upload Source 1 and Source 2 in the sidebar, then click **Run ETL Pipeline**.")
 
     if db_ready():
-        st.success("Database ready")
-        with open(st.session_state.db_path, "rb") as f:
-            st.download_button("⬇ Download SQLite DB", f.read(),
-                               file_name="sales.db", mime="application/x-sqlite3",
-                               use_container_width=True)
+        st.subheader("Current tables in the database")
+        for t in list_tables():
+            n = query(f"SELECT COUNT(*) AS n FROM {t}")["n"][0]
+            st.write(f"- **{t}** — {n:,} rows")
 
-# --- Resolve CSV and run ---
-csv_to_run = None
-if run_clicked:
-    if source == "Use sample data":
-        csv_to_run = SAMPLE_CSV
-    elif uploaded is not None:
-        csv_to_run = st.session_state.workdir / "uploaded.csv"
-        csv_to_run.write_bytes(uploaded.getvalue())
-    else:
-        st.warning("Please upload a CSV file first.")
-
-tab_log, tab_sql, tab_charts = st.tabs(["Pipeline Log", "SQL Explorer", "Charts (Power BI-style)"])
-
-# --- Log tab ---
-with tab_log:
-    if csv_to_run is not None:
-        with st.spinner("Running pipeline…"):
-            run_etl(csv_to_run)
-    elif st.session_state.log:
-        st.code("\n".join(st.session_state.log), language="text")
-    else:
-        st.info("Ready. Choose a CSV in the sidebar and click **Run ETL Pipeline**.")
-
-# --- SQL tab ---
 with tab_sql:
     if not db_ready():
-        st.info("Run the ETL pipeline first.")
+        st.warning("Run the ETL pipeline first — no database found yet.")
     else:
-        db = st.session_state.db_path
-        tables = list_tables(db)
+        tables = list_tables()
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            chosen_table = st.selectbox("Table", tables)
+            if st.button("Preview table"):
+                st.session_state["sql_text"] = f"SELECT * FROM {chosen_table} LIMIT 50;"
 
-        def _on_table_change():
-            st.session_state.sql_text = f"SELECT * FROM {st.session_state.table_choice} LIMIT 50;"
+        default_sql = st.session_state.get("sql_text", "SELECT * FROM fact_sales LIMIT 20;")
+        sql_text = st.text_area("SQL query", value=default_sql, height=120)
 
-        st.selectbox("Table", tables, key="table_choice", on_change=_on_table_change)
-        st.text_area("SQL query (read-only)", key="sql_text", height=140)
-
-        if st.button("▶ Run SQL"):
+        if st.button("▶ Run SQL", type="primary"):
             try:
-                df = query_df(db, st.session_state.sql_text.strip(),
-                              st.session_state.db_version)
-                st.caption(f"{len(df):,} rows × {len(df.columns)} columns")
-                st.dataframe(df, use_container_width=True)
-            except Exception as e:  # noqa: BLE001
+                result = query(sql_text)
+                st.dataframe(result)
+                st.caption(f"{len(result):,} rows returned")
+                st.download_button("Download results as CSV",
+                                   result.to_csv(index=False).encode(),
+                                   "query_results.csv", "text/csv")
+            except Exception as e:
                 st.error(f"SQL error: {e}")
 
-# --- Charts tab ---
+        sql_file = PROJECT_ROOT / "sql" / "queries.sql"
+        with st.expander("Sample reporting queries (sql/queries.sql)"):
+            st.code(sql_file.read_text() if sql_file.exists() else "sql/queries.sql not found",
+                    language="sql")
+
 with tab_charts:
     if not db_ready():
-        st.info("Run the ETL pipeline first.")
+        st.warning("Run the ETL pipeline first — no database found yet.")
     else:
-        choice = st.radio("Chart", list(CHARTS), horizontal=True)
-        sql, builder = CHARTS[choice]
-        try:
-            df = query_df(st.session_state.db_path, sql, st.session_state.db_version)
-            if df.empty:
-                st.warning("No data to chart.")
-            else:
-                fig = builder(df)
-                st.pyplot(fig)
-                plt.close(fig)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Could not build chart: {e}")
+        analysis = st.selectbox("Choose an analysis", [
+            "Revenue Trend (monthly)",
+            "Top Products by Revenue",
+            "Revenue by Region",
+            "Revenue by Category & Quarter (heatmap)",
+            "Region x Category Revenue (heatmap)",
+            "Unit Price vs Quantity (correlation / scatter)",
+            "Order Value Distribution",
+            "Top Customers by Spend",
+            "Revenue by Source System",
+        ])
+
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+
+        if analysis == "Revenue Trend (monthly)":
+            df = query("""
+                SELECT d.year || '-' || printf('%02d', d.month) AS period,
+                       ROUND(SUM(f.revenue),2) AS revenue
+                FROM fact_sales f JOIN dim_date d ON f.date_id = d.date_id
+                GROUP BY d.year, d.month ORDER BY d.year, d.month;""")
+            ax.plot(df["period"], df["revenue"], marker="o")
+            ax.set_title("Monthly Revenue Trend")
+            ax.set_ylabel("Revenue")
+            plt.xticks(rotation=60, fontsize=8)
+
+        elif analysis == "Top Products by Revenue":
+            df = query("""
+                SELECT p.product_name, ROUND(SUM(f.revenue),2) AS revenue
+                FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+                GROUP BY p.product_id ORDER BY revenue DESC LIMIT 10;""")
+            sns.barplot(data=df, y="product_name", x="revenue", ax=ax, orient="h")
+            ax.set_title("Top 10 Products by Revenue")
+
+        elif analysis == "Revenue by Region":
+            df = query("""
+                SELECT r.region_name, ROUND(SUM(f.revenue),2) AS revenue
+                FROM fact_sales f JOIN dim_region r ON f.region_id = r.region_id
+                GROUP BY r.region_id ORDER BY revenue DESC;""")
+            ax.pie(df["revenue"], labels=df["region_name"], autopct="%1.1f%%")
+            ax.set_title("Revenue Share by Region")
+
+        elif analysis == "Revenue by Category & Quarter (heatmap)":
+            df = query("""
+                SELECT d.year || ' Q' || d.quarter AS period, p.category,
+                       ROUND(SUM(f.revenue),2) AS revenue
+                FROM fact_sales f
+                JOIN dim_date d ON f.date_id = d.date_id
+                JOIN dim_product p ON f.product_id = p.product_id
+                GROUP BY period, p.category;""")
+            pivot = df.pivot(index="category", columns="period", values="revenue").fillna(0)
+            sns.heatmap(pivot, annot=True, fmt=".0f", cmap="mako", ax=ax)
+            ax.set_title("Revenue by Category & Quarter")
+
+        elif analysis == "Region x Category Revenue (heatmap)":
+            df = query("""
+                SELECT r.region_name, p.category, ROUND(SUM(f.revenue),2) AS revenue
+                FROM fact_sales f
+                JOIN dim_region r ON f.region_id = r.region_id
+                JOIN dim_product p ON f.product_id = p.product_id
+                GROUP BY r.region_name, p.category;""")
+            pivot = df.pivot(index="region_name", columns="category", values="revenue").fillna(0)
+            sns.heatmap(pivot, annot=True, fmt=".0f", cmap="rocket_r", ax=ax)
+            ax.set_title("Revenue: Region x Category")
+
+        elif analysis == "Unit Price vs Quantity (correlation / scatter)":
+            df = query("SELECT unit_price, quantity, revenue FROM fact_sales;")
+            sns.scatterplot(data=df, x="unit_price", y="quantity", hue="revenue",
+                            palette="viridis", alpha=0.6, ax=ax)
+            ax.set_title(f"Unit Price vs Quantity (r = {df['unit_price'].corr(df['quantity']):.3f})")
+
+        elif analysis == "Order Value Distribution":
+            df = query("SELECT revenue FROM fact_sales;")
+            sns.histplot(df["revenue"], bins=40, kde=True, ax=ax)
+            ax.set_title("Distribution of Order Line Revenue")
+
+        elif analysis == "Top Customers by Spend":
+            df = query("""
+                SELECT c.customer_name, ROUND(SUM(f.revenue),2) AS total_spend
+                FROM fact_sales f JOIN dim_customer c ON f.customer_id = c.customer_id
+                GROUP BY c.customer_id ORDER BY total_spend DESC LIMIT 10;""")
+            sns.barplot(data=df, y="customer_name", x="total_spend", ax=ax, orient="h")
+            ax.set_title("Top 10 Customers by Spend")
+
+        elif analysis == "Revenue by Source System":
+            df = query("""
+                SELECT source_system, ROUND(SUM(revenue),2) AS revenue
+                FROM fact_sales GROUP BY source_system;""")
+            sns.barplot(data=df, x="source_system", y="revenue", ax=ax)
+            ax.set_title("Revenue by Source System")
+
+        fig.tight_layout()
+        st.pyplot(fig)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        st.download_button("Download chart as PNG", buf.getvalue(), "chart.png", "image/png")
